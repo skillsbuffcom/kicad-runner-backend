@@ -11,74 +11,123 @@ jobs:
       image: kicad/kicad:8.0
 
     steps:
-      - name: Install small helpers
-        run: |
-          apt-get update
-          apt-get install -y --no-install-recommends curl jq ca-certificates
-
       - name: Run KiCad checks
         shell: bash
         run: |
           set -euo pipefail
 
           mkdir -p /tmp/syqnal-results
-          echo '${{ toJson(github.event.client_payload) }}' > /tmp/payload.json
+          cat > /tmp/payload.json <<'JSON'
+          ${{ toJson(github.event.client_payload) }}
+          JSON
 
-          jq -c '.runs[]' /tmp/payload.json | while read -r run; do
-            run_id="$(echo "$run" | jq -r '.run_id')"
-            type="$(echo "$run" | jq -r '.type')"
-            file_url="$(echo "$run" | jq -r '.file_url')"
-            file_path="$(echo "$run" | jq -r '.file_path')"
+          python3 - <<'PY'
+          import json
+          import subprocess
+          import urllib.request
+          from pathlib import Path
 
-            if [ "$type" = "DRC" ]; then
-              input="/tmp/${run_id}.kicad_pcb"
-              output="/tmp/${run_id}.json"
-              curl -fsSL "$file_url" -o "$input"
-              kicad-cli pcb drc --output "$output" --format json --exit-code-violations "$input" || true
-            elif [ "$type" = "ERC" ]; then
-              input="/tmp/${run_id}.kicad_sch"
-              output="/tmp/${run_id}.json"
-              curl -fsSL "$file_url" -o "$input"
-              kicad-cli sch erc --output "$output" --format json --exit-code-violations "$input" || true
-            else
-              continue
-            fi
+          payload = json.loads(Path("/tmp/payload.json").read_text())
+          results = []
 
-            jq -n \
-              --arg run_id "$run_id" \
-              --arg type "$type" \
-              --arg file_path "$file_path" \
-              --slurpfile report "$output" \
-              '
-              ($report[0].violations // []) as $violations |
-              ($violations | map(select(.severity == "error")) | length) as $errors |
-              ($violations | map(select(.severity == "warning")) | length) as $warnings |
-              {
-                run_id: $run_id,
-                type: $type,
-                file_path: $file_path,
-                status: (if $errors == 0 then "PASS" else "FAIL" end),
-                tool: "kicad-cli",
-                error_count: $errors,
-                warning_count: $warnings,
-                violations: ($violations | map({
-                  type: (.type // "violation"),
-                  severity: (if .severity == "warning" then "warning" else "error" end),
-                  plain_text: (.description // .message // "KiCad reported a violation."),
-                  items: (.items // [])
-                }))
-              }' > "/tmp/syqnal-results/${run_id}.json"
-          done
+          def normalize_violation(v):
+              severity = "warning" if v.get("severity") == "warning" else "error"
+              return {
+                  "type": v.get("type") or "violation",
+                  "severity": severity,
+                  "plain_text": v.get("description") or v.get("message") or "KiCad reported a violation.",
+                  "items": v.get("items") or [],
+              }
 
-          jq -s '{ runs: . }' /tmp/syqnal-results/*.json > /tmp/syqnal-results.json
+          for run in payload.get("runs", []):
+              run_id = str(run.get("run_id") or "")
+              check_type = str(run.get("type") or "").upper()
+              file_url = run.get("file_url")
+              file_path = run.get("file_path") or ""
+              result = {
+                  "run_id": run_id,
+                  "type": check_type,
+                  "file_path": file_path,
+                  "status": "FAIL",
+                  "tool": "kicad-cli",
+                  "error_count": 1,
+                  "warning_count": 0,
+                  "violations": [],
+              }
+
+              try:
+                  if check_type not in {"DRC", "ERC"}:
+                      raise ValueError(f"Unsupported check type: {check_type}")
+                  if not run_id or not file_url:
+                      raise ValueError("Missing run id or file URL.")
+
+                  suffix = ".kicad_pcb" if check_type == "DRC" else ".kicad_sch"
+                  input_path = Path(f"/tmp/{run_id}{suffix}")
+                  output_path = Path(f"/tmp/{run_id}.json")
+
+                  with urllib.request.urlopen(file_url, timeout=60) as response:
+                      input_path.write_bytes(response.read())
+
+                  command = (
+                      ["kicad-cli", "pcb", "drc", "--output", str(output_path), "--format", "json", "--exit-code-violations", str(input_path)]
+                      if check_type == "DRC"
+                      else ["kicad-cli", "sch", "erc", "--output", str(output_path), "--format", "json", "--exit-code-violations", str(input_path)]
+                  )
+                  completed = subprocess.run(command, text=True, capture_output=True)
+
+                  if output_path.exists() and output_path.stat().st_size > 0:
+                      report = json.loads(output_path.read_text())
+                      violations = [normalize_violation(v) for v in report.get("violations", [])]
+                  else:
+                      message = completed.stderr.strip() or completed.stdout.strip() or "kicad-cli did not produce output."
+                      violations = [{
+                          "type": "runner_error",
+                          "severity": "error",
+                          "plain_text": message,
+                          "items": [],
+                      }]
+
+                  errors = sum(1 for v in violations if v["severity"] != "warning")
+                  warnings = sum(1 for v in violations if v["severity"] == "warning")
+                  result.update({
+                      "status": "PASS" if errors == 0 else "FAIL",
+                      "error_count": errors,
+                      "warning_count": warnings,
+                      "violations": violations,
+                  })
+              except Exception as exc:
+                  result["violations"] = [{
+                      "type": "runner_error",
+                      "severity": "error",
+                      "plain_text": str(exc),
+                      "items": [],
+                  }]
+
+              results.append(result)
+
+          Path("/tmp/syqnal-results.json").write_text(json.dumps({"runs": results}))
+          PY
 
       - name: Report results to Syqnal
         shell: bash
         run: |
-          callback_url="$(jq -r '.callback_url' /tmp/payload.json)"
-          callback_token="$(jq -r '.callback_token' /tmp/payload.json)"
+          python3 - <<'PY'
+          import json
+          import urllib.request
+          from pathlib import Path
 
-          curl -fsSL -X POST "$callback_url" \
-            -H "Content-Type: application/json" \
-            -H "Authorization: Bearer ${callback_token}" \
-            --data-binary @/tmp/syqnal-results.json
+          payload = json.loads(Path("/tmp/payload.json").read_text())
+          data = Path("/tmp/syqnal-results.json").read_bytes()
+          request = urllib.request.Request(
+              payload["callback_url"],
+              data=data,
+              headers={
+                  "Content-Type": "application/json",
+                  "Authorization": f"Bearer {payload['callback_token']}",
+              },
+              method="POST",
+          )
+
+          with urllib.request.urlopen(request, timeout=60) as response:
+              print(response.read().decode("utf-8", errors="replace"))
+          PY
