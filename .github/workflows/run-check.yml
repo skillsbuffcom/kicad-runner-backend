@@ -9,6 +9,11 @@ jobs:
     runs-on: ubuntu-latest
     container:
       image: kicad/kicad:8.0
+    env:
+      HOME: /tmp/syqnal-home
+      XDG_CACHE_HOME: /tmp/syqnal-home/.cache
+      XDG_CONFIG_HOME: /tmp/syqnal-home/.config
+      XDG_DATA_HOME: /tmp/syqnal-home/.local/share
 
     steps:
       - name: Run KiCad checks
@@ -17,6 +22,7 @@ jobs:
           set -euo pipefail
 
           mkdir -p /tmp/syqnal-results
+          mkdir -p "$HOME" "$XDG_CACHE_HOME" "$XDG_CONFIG_HOME/kicad/8.0/colors" "$XDG_DATA_HOME"
           cat > /tmp/payload.json <<'JSON'
           ${{ toJson(github.event.client_payload) }}
           JSON
