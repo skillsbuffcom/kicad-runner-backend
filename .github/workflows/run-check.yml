@@ -1,0 +1,84 @@
+name: Syqnal Remote KiCad Audit
+
+on:
+  repository_dispatch:
+    types: [trigger-audit]
+
+jobs:
+  kicad-check:
+    runs-on: ubuntu-latest
+    container:
+      image: kicad/kicad:8.0
+
+    steps:
+      - name: Install small helpers
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends curl jq ca-certificates
+
+      - name: Run KiCad checks
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p /tmp/syqnal-results
+          echo '${{ toJson(github.event.client_payload) }}' > /tmp/payload.json
+
+          jq -c '.runs[]' /tmp/payload.json | while read -r run; do
+            run_id="$(echo "$run" | jq -r '.run_id')"
+            type="$(echo "$run" | jq -r '.type')"
+            file_url="$(echo "$run" | jq -r '.file_url')"
+            file_path="$(echo "$run" | jq -r '.file_path')"
+
+            if [ "$type" = "DRC" ]; then
+              input="/tmp/${run_id}.kicad_pcb"
+              output="/tmp/${run_id}.json"
+              curl -fsSL "$file_url" -o "$input"
+              kicad-cli pcb drc --output "$output" --format json --exit-code-violations "$input" || true
+            elif [ "$type" = "ERC" ]; then
+              input="/tmp/${run_id}.kicad_sch"
+              output="/tmp/${run_id}.json"
+              curl -fsSL "$file_url" -o "$input"
+              kicad-cli sch erc --output "$output" --format json --exit-code-violations "$input" || true
+            else
+              continue
+            fi
+
+            jq -n \
+              --arg run_id "$run_id" \
+              --arg type "$type" \
+              --arg file_path "$file_path" \
+              --slurpfile report "$output" \
+              '
+              ($report[0].violations // []) as $violations |
+              ($violations | map(select(.severity == "error")) | length) as $errors |
+              ($violations | map(select(.severity == "warning")) | length) as $warnings |
+              {
+                run_id: $run_id,
+                type: $type,
+                file_path: $file_path,
+                status: (if $errors == 0 then "PASS" else "FAIL" end),
+                tool: "kicad-cli",
+                error_count: $errors,
+                warning_count: $warnings,
+                violations: ($violations | map({
+                  type: (.type // "violation"),
+                  severity: (if .severity == "warning" then "warning" else "error" end),
+                  plain_text: (.description // .message // "KiCad reported a violation."),
+                  items: (.items // [])
+                }))
+              }' > "/tmp/syqnal-results/${run_id}.json"
+          done
+
+          jq -s '{ runs: . }' /tmp/syqnal-results/*.json > /tmp/syqnal-results.json
+
+      - name: Report results to Syqnal
+        shell: bash
+        run: |
+          callback_url="$(jq -r '.callback_url' /tmp/payload.json)"
+          callback_token="$(jq -r '.callback_token' /tmp/payload.json)"
+
+          curl -fsSL -X POST "$callback_url" \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer ${callback_token}" \
+            --data-binary @/tmp/syqnal-results.json
