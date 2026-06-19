@@ -8,7 +8,7 @@ jobs:
   kicad-check:
     runs-on: ubuntu-latest
     container:
-      image: kicad/kicad:8.0
+      image: kicad/kicad:10.0.2
     env:
       HOME: /tmp/syqnal-home
       XDG_CACHE_HOME: /tmp/syqnal-home/.cache
