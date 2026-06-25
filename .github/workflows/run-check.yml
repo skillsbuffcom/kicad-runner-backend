@@ -2,7 +2,8 @@ name: Syqnal Remote KiCad Audit
 
 on:
   repository_dispatch:
-    types: [trigger-audit]
+    types: [trigger-kicad-audit]
+  workflow_dispatch:
 
 jobs:
   kicad-check:
