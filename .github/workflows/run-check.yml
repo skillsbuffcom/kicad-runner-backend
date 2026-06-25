@@ -76,15 +76,20 @@ jobs:
                       input_path.write_bytes(response.read())
 
                   command = (
-                      ["kicad-cli", "pcb", "drc", "--output", str(output_path), "--format", "json", "--exit-code-violations", str(input_path)]
+                      ["kicad-cli", "pcb", "drc", "--output", str(output_path), "--format", "json", "--severity-all", "--exit-code-violations", str(input_path)]
                       if check_type == "DRC"
-                      else ["kicad-cli", "sch", "erc", "--output", str(output_path), "--format", "json", "--exit-code-violations", str(input_path)]
+                      else ["kicad-cli", "sch", "erc", "--output", str(output_path), "--format", "json", "--severity-all", "--exit-code-violations", str(input_path)]
                   )
                   completed = subprocess.run(command, text=True, capture_output=True)
 
                   if output_path.exists() and output_path.stat().st_size > 0:
                       report = json.loads(output_path.read_text())
                       violations = [normalize_violation(v) for v in report.get("violations", [])]
+                      unconnected = [
+                          {"type": "unconnected", "severity": "error", "plain_text": str(u), "items": []}
+                          for u in report.get("unconnected_items", [])
+                      ]
+                      violations = violations + unconnected
                   else:
                       message = completed.stderr.strip() or completed.stdout.strip() or "kicad-cli did not produce output."
                       violations = [{
@@ -97,7 +102,7 @@ jobs:
                   errors = sum(1 for v in violations if v["severity"] != "warning")
                   warnings = sum(1 for v in violations if v["severity"] == "warning")
                   result.update({
-                      "status": "PASS" if errors == 0 else "FAIL",
+                      "status": "PASS" if errors == 0 and warnings == 0 else "FAIL",
                       "error_count": errors,
                       "warning_count": warnings,
                       "violations": violations,
