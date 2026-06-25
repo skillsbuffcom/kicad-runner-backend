@@ -84,7 +84,10 @@ jobs:
 
                   if output_path.exists() and output_path.stat().st_size > 0:
                       report = json.loads(output_path.read_text())
-                      violations = [normalize_violation(v) for v in report.get("violations", [])]
+                      top_violations = report.get("violations") or []
+                      sheet_violations = [v for s in report.get("sheets", []) for v in s.get("violations", [])]
+                      raw_violations = top_violations if top_violations else sheet_violations
+                      violations = [normalize_violation(v) for v in raw_violations]
                       unconnected = [
                           {"type": "unconnected", "severity": "error", "plain_text": str(u), "items": []}
                           for u in report.get("unconnected_items", [])
